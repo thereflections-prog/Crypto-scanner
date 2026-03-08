@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Small Cap Gem Finder - DEXScreener</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+
+        // CONFIGURATION CONSTANTS
+        const CONFIG = {
+            USE_DEXSCREENER: true,
+            REFRESH_INTERVAL: 120000, // 2 minutes
+            MAX_RESULTS: 50,
+            COINGECKO_RATE_LIMIT_MS: 1500,
+            DEXSCREENER_RATE_LIMIT_MS: 300,
+            // BALANCED STRATEGY: More tokens, quality via scoring not filtering
+            MIN_AGE_DAYS: 7,         // Lowered from 14 - catch newer tokens
+            MAX_AGE_DAYS: 365,       // Increased from 90 - catch established tokens bottoming
+            MIN_LIQUIDITY: 15000,    // Lowered from $25K - more results
+            MIN_VOLUME_24H: 2500,    // Lowered from $5K - more results
+            REQUIRE_VERIFIED: false, // CHANGED: Optional (use for scoring)
+            REQUIRE_RECOVERY: false, // CHANGED: Optional (use for scoring)
+            MAX_DECLINE_24H: -70,    // CHANGED: Allow -70% (was -60%)
+        };
+
+        // SCORING WEIGHTS
+        const SCORE_WEIGHTS = {
+            MAX_AGE: 27,
+            MAX_LIQUIDITY: 18,
+            MAX_VOLUME: 25,
+            MAX_PRICE_ACTION: 30,
+        };
+
+        // AGE-BASED SCORING
+        const AGE_THRESHOLDS = {
+            MATURE: { days: 30, score: 27 },
+            ESTABLISHED: { days: 14, score: 23 },
+            WEEK_OLD: { days: 7, score: 18 },
+            FEW_DAYS: { days: 3, score: 11 },
+            NEW: { days: 1, score: 5 },
+            VERY_NEW: { days: 0, score: 3 },
+        };
+
+        // VALUE SCORE WEIGHTS (for bottomed opportunities)
+        const VALUE_WEIGHTS = {
+            ESTABLISHED: 20,      // Age/proven track record
+            PULLBACK: 20,         // Recent price decline
+            FUNDAMENTALS: 25,     // Strong base (liquidity + security + verified)
+            REVERSAL: 35,         // Showing bounce/consolidation
+        };
+
+        // HARDCODED BLACKLIST - Major tokens to always exclude
+        const TOKEN_BLACKLIST = new Set([
+            'WETH', 'WBTC', 'USDC', 'USDT', 'DAI', 'BUSD', 'ETH', 'BTC',
+            'BNB', 'MATIC', 'AVAX', 'SOL', 'ADA', 'DOT', 'LINK', 'UNI',
+            'AAVE', 'SHIB', 'DOGE', 'XRP', 'LTC', 'BCH', 'ETC', 'ATOM',
+            'WBNB', 'WMATIC', 'WAVAX', 'WSOL', 'STETH', 'WSTETH',
+        ]);
+
+        // Platform mapping for CoinGecko
+        const PLATFORM_MAP = {
+            'ethereum': 'ethereum',
+            'bsc': 'binance-smart-chain',
+            'base': 'base',
+            'solana': 'solana',
+            'arbitrum': 'arbitrum-one',
+            'polygon': 'polygon-pos',
+        };
+
+        const SmallCapScanner = () => {
+            const [pools, setPools] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+            const [watchlist, setWatchlist] = useState(() => {
+                // Load watchlist from localStorage
+                const saved = localStorage.getItem('crypto-watchlist');
+                return saved ? JSON.parse(saved) : [];
+            });
+            const [lastUpdated, setLastUpdated] = useState(null);
+            const [showDisclaimer, setShowDisclaimer] = useState(() => {
+                return !localStorage.getItem('disclaimer-accepted');
+            });
+            const [filters, setFilters] = useState({
+                maxMarketCap: 20000000,
+                minLiquidity: 10000,
+                minVolume24h: 5000,
+                network: 'all',
+                search: '',
+                minPoolAge: 0,
+            });
+            const [sortBy, setSortBy] = useState('value_score'); // Default to bottomed opportunities
+
+            // Save watchlist to localStorage whenever it changes
+            useEffect(() => {
+                localStorage.setItem('crypto-watchlist', JSON.stringify(watchlist));
+            }, [watchlist]);
+
+            const getTokenSnifferUrl = (network, address) => {
+                const chainName = PLATFORM_MAP[network] || network;
+                return `https://tokensniffer.com/token/${chainName}/${address}`;
+            };
+
+            const getBubblemapsUrl = (network, address) => {
+                const chainId = PLATFORM_MAP[network] || network;
+                return `https://app.bubblemaps.io/${chainId}/token/${address}`;
+            };
+
+            const getDexScreenerUrl = (chainId, pairAddress) => {
+                return `https://dexscreener.com/${chainId}/${pairAddress}`;
+            };
+
+            useEffect(() => {
+                fetchPools();
+                const interval = setInterval(fetchPools, CONFIG.REFRESH_INTERVAL);
+                return () => clearInterval(interval);
+            }, []);
+
+            const fetchPools = async () => {
+                try {
+                    setLoading(true);
+                    setError(null);
+                    
+                    if (CONFIG.USE_DEXSCREENER) {
+                        await fetchFromDEXScreener();
+                        setLastUpdated(new Date());
+                    } else {
+                        throw new Error('GeckoTerminal not implemented. Set USE_DEXSCREENER to true.');
+                    }
+                } catch (err) {
+                    console.error('Fetch error:', err);
+                    setError(err.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            // Improved API fetch wrapper with error handling
+            const safeFetch = async (url, options = {}) => {
+                try {
+                    const response = await fetch(url, options);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return await response.json();
+                } catch (err) {
+                    console.error(`Fetch failed for ${url}:`, err);
+                    return null;
+                }
+            };
+
+            // HYBRID MARKET CAP STRATEGY
+            const getMarketCapFromCoinGecko = async (chainId, tokenAddress) => {
+                const platform = PLATFORM_MAP[chainId];
+                if (!platform || !tokenAddress) return null;
+                
+                try {
+                    // Rate limiting for CoinGecko free tier
+                    await new Promise(resolve => setTimeout(resolve, CONFIG.COINGECKO_RATE_LIMIT_MS));
+                    
+                    const data = await safeFetch(
+                        `https://api.coingecko.com/api/v3/coins/${platform}/contract/${tokenAddress.toLowerCase()}`
+                    );
+                    
+                    if (data && data.market_data && data.market_data.market_cap) {
+                        return {
+                            marketCap: data.market_data.market_cap.usd || null,
+                            isVerified: true,
+                            name: data.name,
+                            symbol: data.symbol,
+                        };
+                    }
+                } catch (err) {
+                    // Token not on CoinGecko or CORS error - this is OK, just use DEXScreener data
+                    // Don't log - these errors are expected and spam the console
+                    return null;
+                }
+                return null;
+            };
+
+            const fetchFromDEXScreener = async () => {
+                const allPools = [];
+                const coinGeckoCache = new Map(); // Cache CoinGecko results
+                
+                // Define search terms outside try block for logging later
+                const searchTerms = [
+                    // Stablecoins (all chains)
+                    'USDC', 'USDT', 'DAI', 'USDE',
+                    
+                    // Native/Wrapped tokens by chain
+                    'WETH',                    // Ethereum
+                    'SOL', 'WSOL',            // Solana
+                    'BNB', 'WBNB',            // BSC
+                    'MATIC', 'WMATIC',        // Polygon
+                    'AVAX', 'WAVAX',          // Avalanche
+                    
+                    // Popular meme/tokens (tokens paired WITH these)
+                    'PEPE', 'SHIB',
+                ];
+                
+                try {
+                    console.log('💎 SMART RECOVERY STRATEGY: Wider age range for more opportunities');
+                    console.log(`Balanced Filters:`);
+                    console.log(`  - Age: ${CONFIG.MIN_AGE_DAYS}-${CONFIG.MAX_AGE_DAYS} days (7 days to 1 year)`);
+                    console.log(`  - Liquidity: $${CONFIG.MIN_LIQUIDITY/1000}K+ (decent funding)`);
+                    console.log(`  - Volume: $${CONFIG.MIN_VOLUME_24H/1000}K+ (some activity)`);
+                    console.log(`  - CoinGecko: Preferred (+13 pts) but not required`);
+                    console.log(`  - Recovery: Preferred (+30 pts) but not required`);
+                    console.log(`  - Result: More tokens shown, high Value Scores = best quality`);
+                    console.log(`Searching ${searchTerms.length} different pair types...`);
+                    console.log('---');
+                    
+                    // STRATEGY: Search for tokens paired with major quote tokens
+                    // This finds tokens across ALL chains that have these pairs
+                    for (const term of searchTerms) {
+                        try {
+                            console.log(`Searching for ${term} pairs...`);
+                            await new Promise(resolve => setTimeout(resolve, CONFIG.DEXSCREENER_RATE_LIMIT_MS));
+                            
+                            const searchData = await safeFetch(
+                                `https://api.dexscreener.com/latest/dex/search?q=${term}`
+                            );
+                            
+                            if (searchData && searchData.pairs) {
+                                console.log(`Found ${searchData.pairs.length} ${term} pairs`);
+                                const processed = await processPairs(searchData.pairs, coinGeckoCache);
+                                allPools.push(...processed);
+                                console.log(`After filtering: ${processed.length} passed criteria`);
+                            } else {
+                                console.log(`No pairs found for ${term}`);
+                            }
+                        } catch (termErr) {
+                            console.error(`Error searching ${term}:`, termErr.message);
+                            // Continue with next search term instead of failing entire scan
+                        }
+                    }
+                    
+                    // ALSO check boosted tokens (but they'll still need to pass filters)
+                    console.log('Checking boosted tokens...');
+                    const boostData = await safeFetch('https://api.dexscreener.com/token-boosts/latest/v1');
+                    
+                    if (boostData && boostData.length > 0) {
+                        const boostsToProcess = boostData.slice(0, 20);
+                        
+                        for (const boost of boostsToProcess) {
+                            await new Promise(resolve => setTimeout(resolve, CONFIG.DEXSCREENER_RATE_LIMIT_MS));
+                            
+                            const pairs = await safeFetch(
+                                `https://api.dexscreener.com/token-pairs/v1/${boost.chainId}/${boost.tokenAddress}`
+                            );
+                            
+                            if (pairs) {
+                                const processed = await processPairs(pairs, coinGeckoCache);
+                                allPools.push(...processed);
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error('Error fetching from DEXScreener:', err);
+                    throw err;
+                }
+                
+                if (allPools.length === 0) {
+                    throw new Error('No bottomed opportunities found matching criteria. Try adjusting filters.');
+                }
+                
+                console.log(`✅ Total candidates found: ${allPools.length}`);
+                
+                // Remove duplicates by token address (not just pair address)
+                const uniquePools = Array.from(
+                    new Map(allPools.map(p => [p.baseTokenAddress, p])).values()
+                );
+                
+                console.log(`📊 Coverage Stats:`);
+                console.log(`   - Total pairs scanned: ${allPools.length}`);
+                console.log(`   - Unique tokens after dedup: ${uniquePools.length}`);
+                console.log(`   - Improvement: ${searchTerms.length} search terms vs 5 previously`);
+                console.log(`   - Expected 3x more coverage than before`);
+                
+                // Show chain breakdown
+                const chainCounts = {};
+                uniquePools.forEach(p => {
+                    chainCounts[p.network] = (chainCounts[p.network] || 0) + 1;
+                });
+                console.log(`   - By chain:`, chainCounts);
+                
+                setPools(uniquePools);
+            };
+
+            const calculateAgeScore = (poolAgeDays) => {
+                if (poolAgeDays > AGE_THRESHOLDS.MATURE.days) return AGE_THRESHOLDS.MATURE.score;
+                if (poolAgeDays > AGE_THRESHOLDS.ESTABLISHED.days) return AGE_THRESHOLDS.ESTABLISHED.score;
+                if (poolAgeDays > AGE_THRESHOLDS.WEEK_OLD.days) return AGE_THRESHOLDS.WEEK_OLD.score;
+                if (poolAgeDays > AGE_THRESHOLDS.FEW_DAYS.days) return AGE_THRESHOLDS.FEW_DAYS.score;
+                if (poolAgeDays > AGE_THRESHOLDS.NEW.days) return AGE_THRESHOLDS.NEW.score;
+                return AGE_THRESHOLDS.VERY_NEW.score;
+            };
+
+            const calculateQualityScore = (liquidityRatio, poolAgeDays, isVerified, volumeToLiquidity) => {
+                let score = 0;
+                
+                // Age reliability (0-30 points)
+                if (poolAgeDays > 30) score += 30;
+                else if (poolAgeDays > 14) score += 25;
+                else if (poolAgeDays > 7) score += 20;
+                else if (poolAgeDays > 3) score += 12;
+                else if (poolAgeDays > 1) score += 5;
+                
+                // Liquidity health (0-25 points)
+                if (liquidityRatio > 15) score += 25;
+                else if (liquidityRatio > 10) score += 20;
+                else if (liquidityRatio > 5) score += 12;
+                else if (liquidityRatio > 3) score += 5;
+                
+                // CoinGecko verification (0-25 points)
+                if (isVerified) score += 25;
+                
+                // Volume stability (0-20 points) - not too low, not suspiciously high
+                if (volumeToLiquidity > 10 && volumeToLiquidity < 200) score += 20;
+                else if (volumeToLiquidity > 5 && volumeToLiquidity < 300) score += 12;
+                else if (volumeToLiquidity > 1) score += 5;
+                
+                return Math.min(100, score);
+            };
+
+            // VALUE SCORE V3: Quality via scoring, not hard filtering
+            // Tokens can score low but still appear - you decide cutoff
+            const calculateValueScore = (poolData) => {
+                let score = 0;
+                
+                // DEAD PROJECT CHECK - Still auto-fail the worst cases
+                if (poolData.priceChange24h < -80) return 0;  // Down >80% = completely dead
+                if (poolData.volume24h < 1000) return 0;       // <$1K volume = completely dead
+                
+                // 1. ESTABLISHED & PROVEN (35 pts) - Wider age range now
+                const age = poolData.poolAgeDays;
+                if (age >= 90) score += 35;       // 90+ days = very established (3+ months)
+                else if (age >= 60) score += 32;  // 60-89 days = established (2-3 months)
+                else if (age >= 30) score += 25;  // 30-59 days = proven (1-2 months)
+                else if (age >= 14) score += 15;  // 14-29 days = survived 2 weeks
+                else if (age >= 7) score += 8;    // 7-13 days = survived 1 week (risky)
+                else return 0;                    // <7 days too new (filtered anyway)
+                
+                // 2. RECOVERY CONFIRMATION (30 pts) - Prefer recovering tokens
+                // CHANGED: No longer auto-fail if still falling, just score lower
+                const priceChange1h = poolData.priceChange1h || 0;
+                const priceChange6h = poolData.priceChange6h || 0;
+                const priceChange24h = poolData.priceChange24h || 0;
+                
+                const recovering24h = priceChange24h > 0;
+                const recovering6h = priceChange6h > 0;
+                const recovering1h = priceChange1h > 0;
+                
+                if (recovering24h && recovering6h && recovering1h) {
+                    score += 30;  // Perfect: Green all timeframes
+                } else if (recovering24h && recovering6h) {
+                    score += 25;  // Strong: 24h + 6h green
+                } else if (recovering6h && recovering1h) {
+                    score += 15;  // Medium: 6h + 1h green
+                } else if (recovering1h && priceChange1h > 5) {
+                    score += 8;   // Weak: Only 1h strong pump
+                } else if (recovering1h) {
+                    score += 3;   // Very weak: Only 1h barely green
+                }
+                // Else 0 pts (still falling, but not filtered out)
+                
+                // BONUS: Recovering after pullback (ideal)
+                if (recovering24h && priceChange24h > 3 && priceChange24h < 30) {
+                    score += 10; // Healthy recovery
+                }
+                
+                // 3. FUNDAMENTALS (25 pts) - Quality indicators
+                const liq = poolData.liquidityRatio || 0;
+                if (liq > 20) score += 12;
+                else if (liq > 15) score += 10;
+                else if (liq > 10) score += 7;
+                else if (liq > 5) score += 4;
+                
+                // CHANGED: CoinGecko verification gives bonus, not required
+                if (poolData.isVerified) {
+                    score += 13; // Big bonus for verification
+                } else {
+                    score += 0;  // But unverified tokens can still appear
+                }
+                
+                // 4. SUSTAINED ACTIVITY (10 pts) - Trading interest
+                const vol = poolData.volumeToLiquidity || 0;
+                if (vol > 50 && vol < 200) score += 10;  // Healthy volume
+                else if (vol > 20 && vol < 300) score += 6;
+                else if (vol > 10) score += 3;
+                
+                return Math.min(100, score);
+            };
+
+            const processPairs = async (pairs, coinGeckoCache) => {
+                const processed = [];
+                
+                for (const pair of pairs) {
+                    const baseSymbol = (pair.baseToken?.symbol || '').toUpperCase();
+                    const quoteSymbol = (pair.quoteToken?.symbol || '').toUpperCase();
+                    
+                    // IMPORTANT: Only blacklist if it's the BASE token (the token we're tracking)
+                    // We WANT tokens paired WITH major tokens (e.g., NEWTOKEN/SOL, NEWTOKEN/WETH)
+                    // We DON'T want to track major tokens themselves (e.g., SOL/USDC where SOL is base)
+                    if (TOKEN_BLACKLIST.has(baseSymbol)) {
+                        continue;
+                    }
+                    
+                    // Log if we found a Solana native pair (for debugging)
+                    if (quoteSymbol === 'SOL' || quoteSymbol === 'WSOL') {
+                        console.log(`Found Solana pair: ${baseSymbol}/${quoteSymbol}`);
+                    }
+                    
+                    const liquidity = parseFloat(pair.liquidity?.usd) || 0;
+                    const volume24h = parseFloat(pair.volume?.h24) || 0;
+                    const dexFdv = parseFloat(pair.fdv) || 0;
+                    
+                    if (liquidity === 0) continue;
+                    
+                    // HYBRID MARKET CAP STRATEGY
+                    let actualMarketCap = dexFdv;
+                    let marketCapSource = 'DEXScreener';
+                    let isVerified = false;
+                    const tokenKey = `${pair.chainId}-${pair.baseToken?.address}`;
+                    
+                    // Skip CoinGecko for Solana (CORS issues)
+                    const shouldCheckCoinGecko = pair.chainId !== 'solana';
+                    
+                    // Check CoinGecko cache first (skip if Solana)
+                    if (shouldCheckCoinGecko && !coinGeckoCache.has(tokenKey)) {
+                        const cgData = await getMarketCapFromCoinGecko(pair.chainId, pair.baseToken?.address);
+                        coinGeckoCache.set(tokenKey, cgData);
+                    }
+                    
+                    if (shouldCheckCoinGecko) {
+                        const cgData = coinGeckoCache.get(tokenKey);
+                        if (cgData && cgData.marketCap) {
+                            actualMarketCap = cgData.marketCap;
+                            marketCapSource = 'CoinGecko';
+                            isVerified = true;
+                            
+                            // Additional safety check: if CoinGecko shows huge market cap, skip
+                            if (actualMarketCap > 100000000) { // $100M+
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    // Filter: only small caps under $20M
+                    if (actualMarketCap > 20000000) {
+                        continue;
+                    }
+                    
+                    const priceChange1h = parseFloat(pair.priceChange?.h1) || 0;
+                    const priceChange6h = parseFloat(pair.priceChange?.h6) || 0;
+                    const priceChange24h = parseFloat(pair.priceChange?.h24) || 0;
+                    
+                    const pairCreatedAt = pair.pairCreatedAt || Date.now();
+                    const poolAgeHours = (Date.now() - pairCreatedAt) / (1000 * 60 * 60);
+                    const poolAgeDays = poolAgeHours / 24;
+                    
+                    // ===== QUALITY FILTERS (Balanced - not too strict) =====
+                    
+                    // 1. AGE FILTER: Must be 14-90 days old (proven survivors)
+                    if (poolAgeDays < CONFIG.MIN_AGE_DAYS || poolAgeDays > CONFIG.MAX_AGE_DAYS) {
+                        continue;
+                    }
+                    
+                    // 2. LIQUIDITY FILTER: Must have $15K+ (reasonable minimum)
+                    if (liquidity < CONFIG.MIN_LIQUIDITY) {
+                        continue;
+                    }
+                    
+                    // 3. VOLUME FILTER: Must be trading $2.5K+ daily (some activity)
+                    if (volume24h < CONFIG.MIN_VOLUME_24H) {
+                        continue;
+                    }
+                    
+                    // 4. DEATH SPIRAL FILTER: Skip complete disasters
+                    if (priceChange24h < CONFIG.MAX_DECLINE_24H) {
+                        continue; // Down >70% in 24h = catastrophic
+                    }
+                    
+                    // 5. INTEREST FILTER: Volume must show some interest
+                    const volumeToLiquidity = liquidity > 0 ? (volume24h / liquidity) * 100 : 0;
+                    if (volumeToLiquidity < 3) {
+                        continue; // Volume/Liq < 3% = completely dead
+                    }
+                    
+                    // NOTE: Removed hard requirements for:
+                    // - CoinGecko verification (now gives +10 Value Score pts)
+                    // - Recovery/green timeframes (now gives +30 Value Score pts)
+                    // This allows more tokens through, but quality tokens still score highest
+                    
+                    // ===== END QUALITY FILTERS =====
+                    
+                    const ageScore = Math.min(SCORE_WEIGHTS.MAX_AGE, calculateAgeScore(poolAgeDays));
+                    
+                    const liquidityRatio = (liquidity / actualMarketCap) * 100;
+                    // volumeToLiquidity already calculated in filter section above (line 505)
+                    
+                    // Improved liquidity scoring
+                    const liquidityScore = Math.min(SCORE_WEIGHTS.MAX_LIQUIDITY, 
+                        (liquidityRatio > 10 ? 7 : liquidityRatio * 0.7) +
+                        (liquidity > 50000 ? 6 : liquidity / 8333) +
+                        (liquidity > 100000 ? 5 : 0)
+                    );
+                    
+                    const volumeSurge = Math.min(SCORE_WEIGHTS.MAX_VOLUME, 
+                        volumeToLiquidity > 100 ? SCORE_WEIGHTS.MAX_VOLUME : volumeToLiquidity / 4
+                    );
+                    
+                    const priceScore = Math.min(SCORE_WEIGHTS.MAX_PRICE_ACTION,
+                        (priceChange1h > 0 ? 10 : 0) +
+                        (priceChange6h > 0 ? 10 : 0) +
+                        (priceChange24h > 0 && priceChange24h < 50 ? 10 : 0)
+                    );
+                    
+                    const gemScore = liquidityScore + volumeSurge + priceScore + ageScore;
+                    
+                    // Calculate Quality Score (separate from Gem Score)
+                    const qualityScore = calculateQualityScore(liquidityRatio, poolAgeDays, isVerified, volumeToLiquidity);
+                    
+                    // Calculate Value Score (bottomed opportunities)
+                    const valueScore = calculateValueScore({
+                        poolAgeDays,
+                        priceChange1h,
+                        priceChange6h,
+                        priceChange24h,
+                        liquidityRatio,
+                        volumeToLiquidity,
+                        isVerified
+                    });
+                    
+                    // Quality flags
+                    const hasStableVolume = volume24h > 1000 && volumeToLiquidity > 10 && volumeToLiquidity < 300;
+                    const hasHealthyLiquidity = liquidityRatio > 5 && liquidity > 25000;
+                    const isEstablished = poolAgeDays > 3;
+                    
+                    const qualityFlags = [];
+                    if (hasStableVolume) qualityFlags.push('Stable volume');
+                    if (hasHealthyLiquidity) qualityFlags.push('Healthy liquidity');
+                    if (isEstablished) qualityFlags.push('Established');
+                    if (isVerified) qualityFlags.push('CoinGecko verified');
+                    
+                    processed.push({
+                        id: pair.pairAddress,
+                        address: pair.pairAddress,
+                        baseTokenAddress: pair.baseToken?.address,
+                        name: (pair.baseToken?.name || 'Unknown').substring(0, 100), // Prevent overflow
+                        symbol: (pair.baseToken?.symbol || '???').substring(0, 20),
+                        image: pair.info?.imageUrl || 'https://via.placeholder.com/32',
+                        price: parseFloat(pair.priceUsd) || 0,
+                        priceChange1h,
+                        priceChange6h,
+                        priceChange24h,
+                        fdv: actualMarketCap,
+                        liquidity,
+                        volume24h,
+                        liquidityRatio,
+                        volumeToLiquidity,
+                        poolAgeDays: Math.round(poolAgeDays * 10) / 10,
+                        gemScore: Math.round(gemScore * 10) / 10,
+                        qualityScore: Math.round(qualityScore * 10) / 10,
+                        valueScore: Math.round(valueScore * 10) / 10,
+                        qualityFlags,
+                        network: pair.chainId,
+                        dexId: pair.dexId,
+                        poolUrl: pair.url || getDexScreenerUrl(pair.chainId, pair.pairAddress),
+                        tokenSnifferUrl: getTokenSnifferUrl(pair.chainId, pair.baseToken?.address),
+                        bubblemapsUrl: getBubblemapsUrl(pair.chainId, pair.baseToken?.address),
+                        marketCapSource,
+                        isVerified,
+                    });
+                }
+                
+                return processed;
+            };
+
+            const toggleWatchlist = (poolId) => {
+                setWatchlist(prev => 
+                    prev.includes(poolId) 
+                        ? prev.filter(id => id !== poolId)
+                        : [...prev, poolId]
+                );
+            };
+
+            const acceptDisclaimer = () => {
+                localStorage.setItem('disclaimer-accepted', 'true');
+                setShowDisclaimer(false);
+            };
+
+            const exportToCSV = () => {
+                const headers = ['Token', 'Symbol', 'Price', '24h %', 'FDV', 'Liquidity', 'Age (days)', 'Gem Score', 'Network', 'URL'];
+                const rows = sortedPools.map(pool => [
+                    pool.name,
+                    pool.symbol,
+                    pool.price,
+                    pool.priceChange24h,
+                    pool.fdv,
+                    pool.liquidity,
+                    pool.poolAgeDays,
+                    pool.gemScore,
+                    pool.network,
+                    pool.poolUrl,
+                ]);
+                
+                const csvContent = [headers, ...rows]
+                    .map(row => row.map(cell => `"${cell}"`).join(','))
+                    .join('\n');
+                
+                const blob = new Blob([csvContent], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `small-cap-gems-${new Date().toISOString().split('T')[0]}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            // Memoized filtered and sorted pools for performance
+            const filteredPools = useMemo(() => {
+                return pools.filter(pool => {
+                    if (pool.fdv > filters.maxMarketCap) return false;
+                    if (pool.liquidity < filters.minLiquidity) return false;
+                    if (pool.volume24h < filters.minVolume24h) return false;
+                    if (pool.poolAgeDays < filters.minPoolAge) return false;
+                    if (filters.network !== 'all' && pool.network !== filters.network) return false;
+                    if (filters.search && 
+                        !pool.name.toLowerCase().includes(filters.search.toLowerCase()) && 
+                        !pool.symbol.toLowerCase().includes(filters.search.toLowerCase())) return false;
+                    
+                    return true;
+                });
+            }, [pools, filters]);
+
+            const sortedPools = useMemo(() => {
+                return [...filteredPools].sort((a, b) => {
+                    switch (sortBy) {
+                        case 'value_score':
+                            return b.valueScore - a.valueScore;
+                        case 'gem_score':
+                            return b.gemScore - a.gemScore;
+                        case 'quality_score':
+                            return b.qualityScore - a.qualityScore;
+                        case 'liquidity_ratio':
+                            return b.liquidityRatio - a.liquidityRatio;
+                        case 'volume_surge':
+                            return b.volumeToLiquidity - a.volumeToLiquidity;
+                        case 'age':
+                            return b.poolAgeDays - a.poolAgeDays;
+                        default:
+                            return 0;
+                    }
+                });
+            }, [filteredPools, sortBy]);
+
+            const formatNumber = (num) => {
+                if (!num) return '$0';
+                if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
+                if (num >= 1e3) return `$${(num / 1e3).toFixed(1)}K`;
+                return `$${num.toFixed(2)}`;
+            };
+
+            const formatPercent = (num) => {
+                if (num === null || num === undefined) return '0.00%';
+                const formatted = num.toFixed(2);
+                return num > 0 ? `+${formatted}%` : `${formatted}%`;
+            };
+
+            const getGemScoreColor = (score) => {
+                if (score >= 65) return 'text-green-600 bg-green-100 font-bold';
+                if (score >= 50) return 'text-green-500 bg-green-50';
+                if (score >= 35) return 'text-yellow-600 bg-yellow-50';
+                return 'text-gray-600 bg-gray-100';
+            };
+
+            const getQualityScoreColor = (score) => {
+                if (score >= 70) return 'text-blue-600 bg-blue-100 font-bold';
+                if (score >= 50) return 'text-blue-500 bg-blue-50';
+                if (score >= 30) return 'text-orange-600 bg-orange-50';
+                return 'text-red-600 bg-red-100';
+            };
+
+            const getValueScoreColor = (score) => {
+                if (score >= 70) return 'text-purple-600 bg-purple-100 font-bold';
+                if (score >= 50) return 'text-purple-500 bg-purple-50';
+                if (score >= 30) return 'text-yellow-600 bg-yellow-50';
+                return 'text-gray-600 bg-gray-100';
+            };
+
+            const getRiskLevel = (ratio, days, isVerified) => {
+                if (isVerified && ratio > 10 && days > 7) return { emoji: '🟢', text: 'Low Risk' };
+                if (ratio > 5 && days > 3) return { emoji: '🟡', text: 'Medium Risk' };
+                return { emoji: '🔴', text: 'High Risk' };
+            };
+
+            if (showDisclaimer) {
+                return (
+                    <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-4">
+                        <div className="max-w-2xl bg-gray-800 border-2 border-red-600 rounded-lg p-8">
+                            <h2 className="text-2xl font-bold text-red-400 mb-4">⚠️ IMPORTANT DISCLAIMER</h2>
+                            <div className="space-y-4 text-gray-300 mb-6">
+                                <p className="font-semibold">This tool is for INFORMATIONAL PURPOSES ONLY. By using this scanner:</p>
+                                <ul className="list-disc list-inside space-y-2 ml-4">
+                                    <li>You acknowledge that cryptocurrency trading carries EXTREME RISK</li>
+                                    <li>Many tokens shown may be scams, rug pulls, or have malicious contracts</li>
+                                    <li>ALWAYS verify tokens using TokenSniffer (75+ score) and Bubblemaps</li>
+                                    <li>NEVER invest more than you can afford to lose</li>
+                                    <li>This is NOT financial advice - Do Your Own Research (DYOR)</li>
+                                    <li>The creator is NOT responsible for any financial losses</li>
+                                </ul>
+                                <p className="text-red-400 font-bold mt-4">
+                                    Most small cap tokens will go to ZERO. Only invest what you're willing to lose completely.
+                                </p>
+                            </div>
+                            <button
+                                onClick={acceptDisclaimer}
+                                className="w-full px-6 py-3 bg-red-600 hover:bg-red-700 text-white font-bold rounded"
+                            >
+                                I Understand the Risks - Continue
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (loading && pools.length === 0) {
+                return (
+                    <div className="min-h-screen bg-gray-900 text-white p-8 flex items-center justify-center">
+                        <div className="text-center">
+                            <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                            <p className="text-gray-400">Scanning DEXScreener...</p>
+                            <p className="text-sm text-gray-500 mt-2">Checking CoinGecko for verified tokens (30-45 sec)</p>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (error) {
+                return (
+                    <div className="min-h-screen bg-gray-900 text-white p-8 flex items-center justify-center">
+                        <div className="text-center max-w-md">
+                            <p className="text-red-400 mb-4">Error: {error}</p>
+                            <button 
+                                onClick={fetchPools}
+                                className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
+                            >
+                                Retry
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="min-h-screen bg-gray-900 text-white">
+                    <div className="bg-gray-800 border-b border-gray-700 p-6">
+                        <div className="max-w-7xl mx-auto">
+                            <div className="flex items-center justify-between mb-6">
+                                <div>
+                                    <h1 className="text-3xl font-bold">💎 Smart Recovery Finder v4.2</h1>
+                                    <p className="text-gray-400 mt-1">Wider range · 7-365 days · $15K+ liq · $2.5K+ vol · Value Score prioritizes verified + recovering</p>
+                                    {lastUpdated && (
+                                        <p className="text-xs text-gray-500 mt-1">
+                                            Last updated: {lastUpdated.toLocaleTimeString()}
+                                        </p>
+                                    )}
+                                </div>
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={exportToCSV}
+                                        className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm"
+                                        disabled={sortedPools.length === 0}
+                                    >
+                                        📊 Export CSV
+                                    </button>
+                                    <div className="px-4 py-2 bg-gray-700 rounded">
+                                        Found ({pools.length})
+                                    </div>
+                                    <div className="px-4 py-2 bg-blue-600 rounded">
+                                        ⭐ Watchlist ({watchlist.length})
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Search</label>
+                                    <input
+                                        type="text"
+                                        placeholder="Name or symbol..."
+                                        value={filters.search}
+                                        onChange={(e) => setFilters({...filters, search: e.target.value})}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 outline-none text-white"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Max FDV</label>
+                                    <select
+                                        value={filters.maxMarketCap}
+                                        onChange={(e) => setFilters({...filters, maxMarketCap: Number(e.target.value)})}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 outline-none text-white"
+                                    >
+                                        <option value={1000000}>$1M</option>
+                                        <option value={5000000}>$5M</option>
+                                        <option value={10000000}>$10M</option>
+                                        <option value={20000000}>$20M</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Min Liquidity</label>
+                                    <select
+                                        value={filters.minLiquidity}
+                                        onChange={(e) => setFilters({...filters, minLiquidity: Number(e.target.value)})}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 outline-none text-white"
+                                    >
+                                        <option value={0}>All</option>
+                                        <option value={10000}>$10K+</option>
+                                        <option value={25000}>$25K+</option>
+                                        <option value={50000}>$50K+</option>
+                                        <option value={100000}>$100K+</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Min Age</label>
+                                    <select
+                                        value={filters.minPoolAge}
+                                        onChange={(e) => setFilters({...filters, minPoolAge: Number(e.target.value)})}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 outline-none text-white"
+                                    >
+                                        <option value={0}>All</option>
+                                        <option value={1}>1+ days</option>
+                                        <option value={3}>3+ days</option>
+                                        <option value={7}>7+ days</option>
+                                        <option value={30}>30+ days</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Network</label>
+                                    <select
+                                        value={filters.network}
+                                        onChange={(e) => setFilters({...filters, network: e.target.value})}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 outline-none text-white"
+                                    >
+                                        <option value="all">All</option>
+                                        <option value="ethereum">ETH</option>
+                                        <option value="bsc">BSC</option>
+                                        <option value="base">Base</option>
+                                        <option value="solana">Solana</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-400 mb-1">Sort By</label>
+                                    <select
+                                        value={sortBy}
+                                        onChange={(e) => setSortBy(e.target.value)}
+                                        className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 outline-none text-white"
+                                    >
+                                        <option value="value_score">Value Score (Bottoms)</option>
+                                        <option value="gem_score">Gem Score (Momentum)</option>
+                                        <option value="quality_score">Quality Score (Safety)</option>
+                                        <option value="age">Age</option>
+                                        <option value="liquidity_ratio">Liquidity</option>
+                                        <option value="volume_surge">Volume</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div className="mt-4 p-3 bg-blue-900/30 border border-blue-700 rounded text-sm text-blue-300">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    <div>
+                                        <strong>💎 Gem Score (0-100) - Momentum/Opportunity:</strong>
+                                        <div className="text-xs mt-1">{SCORE_WEIGHTS.MAX_AGE}pts Age · {SCORE_WEIGHTS.MAX_PRICE_ACTION}pts Price Action · {SCORE_WEIGHTS.MAX_VOLUME}pts Volume · {SCORE_WEIGHTS.MAX_LIQUIDITY}pts Liquidity</div>
+                                    </div>
+                                    <div>
+                                        <strong>🛡️ Quality Score (0-100) - Safety/Legitimacy:</strong>
+                                        <div className="text-xs mt-1">30pts Age Reliability · 25pts Liquidity Health · 25pts CoinGecko Verified · 20pts Volume Stability</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-gray-800 border-b border-gray-700 p-4">
+                        <div className="max-w-7xl mx-auto text-sm text-gray-400">
+                            Showing <span className="text-white font-semibold">{sortedPools.length}</span> tokens 
+                            {sortedPools.filter(p => p.isVerified).length > 0 && (
+                                <span className="ml-2">
+                                    · <span className="text-green-400">{sortedPools.filter(p => p.isVerified).length}</span> CoinGecko verified
+                                </span>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="max-w-7xl mx-auto p-6">
+                        <div className="bg-gray-800 rounded-lg overflow-hidden">
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead className="bg-gray-700 text-gray-300">
+                                        <tr>
+                                            <th className="px-3 py-3 text-left">★</th>
+                                            <th className="px-3 py-3 text-left">Token</th>
+                                            <th className="px-3 py-3 text-right">Price</th>
+                                            <th className="px-3 py-3 text-right">1h</th>
+                                            <th className="px-3 py-3 text-right">24h</th>
+                                            <th className="px-3 py-3 text-right">FDV</th>
+                                            <th className="px-3 py-3 text-right">Liq</th>
+                                            <th className="px-3 py-3 text-center">Age</th>
+                                            <th className="px-3 py-3 text-center">Risk</th>
+                                            <th className="px-3 py-3 text-center">Value</th>
+                                            <th className="px-3 py-3 text-center">Gem</th>
+                                            <th className="px-3 py-3 text-center">Quality</th>
+                                            <th className="px-3 py-3 text-center">Verify</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-700">
+                                        {sortedPools.slice(0, CONFIG.MAX_RESULTS).map((pool) => {
+                                            const riskLevel = getRiskLevel(pool.liquidityRatio, pool.poolAgeDays, pool.isVerified);
+                                            return (
+                                                <tr key={pool.id} className="hover:bg-gray-700">
+                                                    <td className="px-3 py-2">
+                                                        <button 
+                                                            onClick={() => toggleWatchlist(pool.id)} 
+                                                            className="text-xl hover:scale-110 transition-transform"
+                                                        >
+                                                            {watchlist.includes(pool.id) ? '⭐' : '☆'}
+                                                        </button>
+                                                    </td>
+                                                    <td className="px-3 py-2">
+                                                        <div className="flex items-center gap-2">
+                                                            <img 
+                                                                src={pool.image} 
+                                                                alt={pool.name} 
+                                                                className="w-6 h-6 rounded-full"
+                                                                onError={(e) => e.target.src = 'https://via.placeholder.com/32'}
+                                                            />
+                                                            <div>
+                                                                <a 
+                                                                    href={pool.poolUrl} 
+                                                                    target="_blank" 
+                                                                    rel="noopener noreferrer" 
+                                                                    className="font-semibold text-sm hover:text-blue-400 flex items-center gap-1"
+                                                                >
+                                                                    {pool.name}
+                                                                    {pool.isVerified && <span className="text-green-400" title="CoinGecko Verified">✓</span>}
+                                                                </a>
+                                                                <div className="text-xs text-gray-400 uppercase">{pool.symbol}</div>
+                                                            </div>
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-3 py-2 text-right font-mono text-xs">
+                                                        ${pool.price.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 8})}
+                                                    </td>
+                                                    <td className={`px-3 py-2 text-right text-sm ${pool.priceChange1h > 0 ? 'text-green-500' : pool.priceChange1h < 0 ? 'text-red-500' : 'text-gray-400'}`}>
+                                                        {pool.priceChange1h !== 0 ? formatPercent(pool.priceChange1h) : '-'}
+                                                    </td>
+                                                    <td className={`px-3 py-2 text-right font-semibold ${pool.priceChange24h > 0 ? 'text-green-500' : pool.priceChange24h < 0 ? 'text-red-500' : 'text-gray-400'}`}>
+                                                        {pool.priceChange24h !== 0 ? formatPercent(pool.priceChange24h) : '-'}
+                                                    </td>
+                                                    <td className="px-3 py-2 text-right font-mono text-gray-300">
+                                                        <div>{formatNumber(pool.fdv)}</div>
+                                                        <div className="text-xs text-gray-500">{pool.marketCapSource}</div>
+                                                    </td>
+                                                    <td className="px-3 py-2 text-right font-mono text-gray-300">
+                                                        {formatNumber(pool.liquidity)}
+                                                    </td>
+                                                    <td className="px-3 py-2 text-center text-gray-300">
+                                                        {pool.poolAgeDays}d
+                                                    </td>
+                                                    <td className="px-3 py-2 text-center">
+                                                        <div className="flex flex-col items-center">
+                                                            <span className="text-xl">{riskLevel.emoji}</span>
+                                                            <span className="text-xs text-gray-400">{riskLevel.text}</span>
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-3 py-2">
+                                                        <div className={`px-2 py-1 rounded-full text-center ${getValueScoreColor(pool.valueScore)}`}>
+                                                            {pool.valueScore.toFixed(0)}
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-3 py-2">
+                                                        <div className={`px-2 py-1 rounded-full text-center ${getGemScoreColor(pool.gemScore)}`}>
+                                                            {pool.gemScore.toFixed(0)}
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-3 py-2">
+                                                        <div className={`px-2 py-1 rounded-full text-center ${getQualityScoreColor(pool.qualityScore)}`}>
+                                                            {pool.qualityScore.toFixed(0)}
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-3 py-2 text-center">
+                                                        <div className="flex gap-1 justify-center">
+                                                            <a 
+                                                                href={pool.tokenSnifferUrl} 
+                                                                target="_blank" 
+                                                                rel="noopener noreferrer"
+                                                                className="px-2 py-1 bg-yellow-600 hover:bg-yellow-700 text-white rounded text-xs font-semibold"
+                                                                title="TokenSniffer (must be 75+)"
+                                                            >
+                                                                TS
+                                                            </a>
+                                                            <a 
+                                                                href={pool.bubblemapsUrl} 
+                                                                target="_blank" 
+                                                                rel="noopener noreferrer"
+                                                                className="px-2 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-semibold"
+                                                                title="Bubblemaps holder distribution"
+                                                            >
+                                                                BM
+                                                            </a>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div className="mt-6 p-4 bg-red-900/20 border border-red-800 rounded-lg text-sm text-gray-300">
+                            <strong className="text-red-400">⚠️ HOW TO USE VALUE SCORES (v4.2 - Wider Age Range):</strong><br/>
+                            <strong>💜 Value Score (Purple):</strong> 35pts Age (90+d=35, 60+d=32, 30+d=25, 14+d=15, 7+d=8) · 30pts Recovery · 25pts Fundamentals · 10pts Activity<br/>
+                            <strong className="text-yellow-400">📊 Score Interpretation:</strong><br/>
+                            • <strong>80-100:</strong> Excellent - Established (60+d), verified, recovering (BEST entries)<br/>
+                            • <strong>60-79:</strong> Good - Most criteria met, may be newer (14-60d) or unverified<br/>
+                            • <strong>40-59:</strong> Medium - Some red flags, possibly very new (7-14d) or still falling<br/>
+                            • <strong>0-39:</strong> Poor - Missing key criteria (High risk/avoid)<br/>
+                            <strong className="text-green-400">✅ Wider Strategy:</strong> Now shows 7-365 day tokens. Newer tokens (7-14d) score lower but may be early gems. Older tokens (90-365d) score high if bottoming.<br/>
+                            <strong>Always verify:</strong> TS (75+ score) · BM (check whale distribution) · Read contract · DYOR!
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<SmallCapScanner />, document.getElementById('root'));
+    </script>
+</body>
+</html>
